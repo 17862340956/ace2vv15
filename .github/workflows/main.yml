@@ -1,0 +1,92 @@
+name: PHP110 direct KO legacy DDK flow
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/ylarod/ddk:android12-5.10
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check required repository files
+        run: |
+          set -eu
+          missing=0
+          for file in cpuinfo_spoof.c kirin9020.h php110_layout.h Makefile fix_vermagic.py report_fast.py run.sh; do
+            if [ ! -s "$file" ]; then
+              echo "::error::Missing or empty repository-root file: $file"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo 'Upload the listed files beside Makefile; retain .github/workflows/build.yml.'
+            ls -la
+            exit 1
+          fi
+      - name: Compile only cpuinfo_spoof.ko
+        run: |
+          set -eu
+          test -n "$KDIR"
+          test -s "$KDIR/Makefile"
+          test -s "$KDIR/Module.symvers"
+          clang --version
+          make KDIR="$KDIR" KCFLAGS=-g
+          test -s cpuinfo_spoof.ko
+          llvm-objcopy --decompress-debug-sections cpuinfo_spoof.ko
+          cat .cpuinfo_spoof.o.cmd > build_flags.txt
+          grep -q -- '-fsanitize=cfi' build_flags.txt || {
+            echo '::error::Expected CFI compiler flag missing.'
+            exit 1
+          }
+      - name: Fix target release metadata
+        run: python3 fix_vermagic.py cpuinfo_spoof.ko
+      - name: Upload intermediate KO
+        uses: actions/upload-artifact@v4
+        with:
+          name: php110-legacy-intermediate
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            cpuinfo_spoof.ko
+            build_flags.txt
+
+  verify:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          name: php110-legacy-intermediate
+          path: verified-artifact
+      - name: Install verification library
+        run: python -m pip install pyelftools==0.33
+      - name: Verify and prepare phone files
+        run: |
+          set -eu
+          grep -q -- '-fsanitize=cfi' verified-artifact/build_flags.txt
+          python report_fast.py verified-artifact/cpuinfo_spoof.ko verified-artifact/build_report.json
+          cp run.sh verified-artifact/run.sh
+          cd verified-artifact
+          sha256sum cpuinfo_spoof.ko build_report.json run.sh > SHA256SUMS.txt
+      - name: Upload verified phone files
+        uses: actions/upload-artifact@v4
+        with:
+          name: php110-legacy-verified
+          if-no-files-found: error
+          path: |
+            verified-artifact/cpuinfo_spoof.ko
+            verified-artifact/build_report.json
+            verified-artifact/run.sh
+            verified-artifact/SHA256SUMS.txt
+            verified-artifact/build_flags.txt
